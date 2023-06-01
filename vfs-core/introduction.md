@@ -199,18 +199,26 @@ struct inode_operations
 
 同样，除非另有说明，否则调用所有方法时不会持有任何锁。
 
-| 调用         | 说明                                                         |
-| ------------ | ------------------------------------------------------------ |
-| `create`     | 由`open(2)`和`create(2)`系统调用来调用。只有当您想要支持常规文件时才需要。您得到的`dentry`不应该有索引节点(即，它应该是一个负`dentry`)。在这里，您可能会使用`dentry`和新创建的`inode`调用`d_instantiate()` |
-| `lookup`     | 当`VFS`需要在父目录中查找索引节点时调用。要查找的名称在`dentry`中找到。这个方法必须调用`d_add()`将找到的索引节点插入到条目中。`inode`结构中的“`i_count`”字段应该递增。如果指定的`inode`不存在，则应该将`NULL inode`插入到`dentry`中(这称为`负dentry`)。从这个例程返回错误代码必须只在发生实际错误时执行，否则使用`create(2)`、`mknod(2)`、`mkdir(2)`等系统调用创建索引节点将失败。如果你想重载`dentry`方法，那么你应该初始化`dentry`中的“`d_dop`”字段;这是一个指向“`struct dentry_operations`”的指针。此方法在持有目录索引节点信号量时调用 |
-| `link`       | 由`link(2)`系统调用调用。只有当你想支持硬链接时才需要。您可能需要调用`d_instantiate()`，就像在`create()`方法中一样 |
-| `unlink`     | `unlink(2)`系统调用调用。只有当您想要支持删除索引节点时才需要 |
-| `symlink`    | 由`symlink(2)`系统调用调用。只有当您想要支持符号链接时才需要。您可能需要调用`d_instantiate()`，就像在`create()`方法中一样 |
-| `mkdir`      | 由`mkdir(2)`系统调用调用。仅当您希望支持创建子目录时才需要。您可能需要调用`d_instantiate()`，就像在`create()`方法中一样 |
-| `rmdir`      | 由`rmdir(2)`系统调用调用。只有当您希望支持删除子目录时才需要 |
-| `mknod`      | 由`mknod(2)`系统调用调用，用于创建设备`(char, block) inode`或命名管道(`FIFO`)或`套接字`。只有当您希望支持创建这些类型的索引节点时才需要。您可能需要调用`d_instantiate()`，就像在`create()`方法中一样 |
-| `rename`     | 由`rename(2)`系统调用调用，用于重命名对象，使其具有第二个`inode`和`dentry`给出的父节点和名称。<br/><br/>对于任何不支持的或未知的标志，文件系统必须返回`-EINVAL`。目前实现了以下标志:(1)`RENAME_NOREPLACE`：该标志表示如果重命名的目标存在，重命名应该使用`-EEXIST`失败，而不是替换目标。`VFS`已经检查是否存在，因此对于本地文件系统，`RENAME_NOREPLACE`实现等同于普通的重命名。(2) `RENAME_EXCHANGE`：交换源和目标。两者都必须存在;这是由`VFS`检查的。与普通的重命名不同，源和目标可以是不同的类型。 |
-| `get_link`   | 由`VFS`调用，以遵循指向它所指向的索引节点的符号链接。只有当你想支持符号链接时才需要。此方法返回要遍历的符号链接主体(并可能使用`nd_jump_link()`重置当前位置)。如果在`inode`消失之前主体不会消失，则不需要其他任何东西;如果需要以其他方式固定它，则通过`get_link(…，…，done)`执行`set_delayed_call(done, destructor, argument)`来安排它的释放。在这种情况下，一旦`VFS`处理完返回的函数体，就会调用析构函数(参数)。可以在`RCU`模式下调用;由`NULL dentry`参数表示。如果请求不能在不离开`RCU`模式的情况下处理，让它返回`ERR_PTR(-ECHILD)`。<br/><br/>如果文件系统将符号链接目标存储在`->i_link`中，`VFS`可以直接使用它，而不需要调用`->get_link()`;但是，仍然必须提供`->get_link()`。`->i_link`必须在`RCU`宽限期之后才被释放。在`iget()`之后写入`->i_link`需要一个' `release` '内存屏障。 |
-| `readlink`   | 当`->get_link`使用`nd_jump_link()`或`object`实际上不是符号链接时，这只是`readlink(2)`使用的覆盖。通常，文件系统应该只对符号链接实现`->get_link`, `readlink(2)`将自动使用它。 |
-| `permission` | 由`VFS`调用，用于检查类`posix`文件系统上的访问权限。<br/><br/>可以在`rcu-walk`模式下调用`(mask & MAY_NOT_BLOCK)`。如果是`rcu-walk`模式，文件系统必须在不阻塞或存储到索引节点的情况下检查权限。<br/><br/>如果遇到`rcu-walk`无法处理的情况，返回`-ECHILD`，它将在`ref-walk`模式下再次被调用。 |
+| 调用           | 说明                                                         |
+| -------------- | ------------------------------------------------------------ |
+| `create`       | 由`open(2)`和`create(2)`系统调用来调用。只有当您想要支持常规文件时才需要。您得到的`dentry`不应该有索引节点(即，它应该是一个负`dentry`)。在这里，您可能会使用`dentry`和新创建的`inode`调用`d_instantiate()` |
+| `lookup`       | 当`VFS`需要在父目录中查找索引节点时调用。要查找的名称在`dentry`中找到。这个方法必须调用`d_add()`将找到的索引节点插入到条目中。`inode`结构中的“`i_count`”字段应该递增。如果指定的`inode`不存在，则应该将`NULL inode`插入到`dentry`中(这称为`负dentry`)。从这个例程返回错误代码必须只在发生实际错误时执行，否则使用`create(2)`、`mknod(2)`、`mkdir(2)`等系统调用创建索引节点将失败。如果你想重载`dentry`方法，那么你应该初始化`dentry`中的“`d_dop`”字段;这是一个指向“`struct dentry_operations`”的指针。此方法在持有目录索引节点信号量时调用 |
+| `link`         | 由`link(2)`系统调用调用。只有当你想支持硬链接时才需要。您可能需要调用`d_instantiate()`，就像在`create()`方法中一样 |
+| `unlink`       | `unlink(2)`系统调用调用。只有当您想要支持删除索引节点时才需要 |
+| `symlink`      | 由`symlink(2)`系统调用调用。只有当您想要支持符号链接时才需要。您可能需要调用`d_instantiate()`，就像在`create()`方法中一样 |
+| `mkdir`        | 由`mkdir(2)`系统调用调用。仅当您希望支持创建子目录时才需要。您可能需要调用`d_instantiate()`，就像在`create()`方法中一样 |
+| `rmdir`        | 由`rmdir(2)`系统调用调用。只有当您希望支持删除子目录时才需要 |
+| `mknod`        | 由`mknod(2)`系统调用调用，用于创建设备`(char, block) inode`或命名管道(`FIFO`)或`套接字`。只有当您希望支持创建这些类型的索引节点时才需要。您可能需要调用`d_instantiate()`，就像在`create()`方法中一样 |
+| `rename`       | 由`rename(2)`系统调用调用，用于重命名对象，使其具有第二个`inode`和`dentry`给出的父节点和名称。<br/><br/>对于任何不支持的或未知的标志，文件系统必须返回`-EINVAL`。目前实现了以下标志:(1)`RENAME_NOREPLACE`：该标志表示如果重命名的目标存在，重命名应该使用`-EEXIST`失败，而不是替换目标。`VFS`已经检查是否存在，因此对于本地文件系统，`RENAME_NOREPLACE`实现等同于普通的重命名。(2) `RENAME_EXCHANGE`：交换源和目标。两者都必须存在;这是由`VFS`检查的。与普通的重命名不同，源和目标可以是不同的类型。 |
+| `get_link`     | 由`VFS`调用，以遵循指向它所指向的索引节点的符号链接。只有当你想支持符号链接时才需要。此方法返回要遍历的符号链接主体(并可能使用`nd_jump_link()`重置当前位置)。如果在`inode`消失之前主体不会消失，则不需要其他任何东西;如果需要以其他方式固定它，则通过`get_link(…，…，done)`执行`set_delayed_call(done, destructor, argument)`来安排它的释放。在这种情况下，一旦`VFS`处理完返回的函数体，就会调用析构函数(参数)。可以在`RCU`模式下调用;由`NULL dentry`参数表示。如果请求不能在不离开`RCU`模式的情况下处理，让它返回`ERR_PTR(-ECHILD)`。<br/><br/>如果文件系统将符号链接目标存储在`->i_link`中，`VFS`可以直接使用它，而不需要调用`->get_link()`;但是，仍然必须提供`->get_link()`。`->i_link`必须在`RCU`宽限期之后才被释放。在`iget()`之后写入`->i_link`需要一个' `release` '内存屏障。 |
+| `readlink`     | 当`->get_link`使用`nd_jump_link()`或`object`实际上不是符号链接时，这只是`readlink(2)`使用的覆盖。通常，文件系统应该只对符号链接实现`->get_link`, `readlink(2)`将自动使用它。 |
+| `permission`   | 由`VFS`调用，用于检查类`posix`文件系统上的访问权限。<br/><br/>可以在`rcu-walk`模式下调用`(mask & MAY_NOT_BLOCK)`。如果是`rcu-walk`模式，文件系统必须在不阻塞或存储到索引节点的情况下检查权限。<br/><br/>如果遇到`rcu-walk`无法处理的情况，返回`-ECHILD`，它将在`ref-walk`模式下再次被调用。 |
+| `setattr`      | 由`VFS`调用，用于设置文件的属性。这个方法由`chmod(2)`和相关的系统调用调用。 |
+| `getattr`      | 由`VFS`调用以获取文件的属性。这个方法由`stat(2)`和相关的系统调用调用。 |
+| `listxattr`    | 由`VFS`调用，列出给定文件的所有扩展属性。该方法由`listxattr(2)`系统调用调用。 |
+| `update_time`  | 由`VFS`调用以更新`inode`的特定时间或`i_version`。如果没有定义，`VFS`将更新`inode`本身并调用`mark_inode_dirty_sync`。 |
+| `atomic_open`  | 在开盘的最后一个分量上调用。使用这个可选方法，文件系统可以在一个原子操作中查找、可能创建和打开文件。如果它想把实际的打开留给调用者(例如，如果文件被证明是一个符号链接、设备，或者只是文件系统不会对其进行原子打开的东西)，它可以通过返回`finish_no_open(file, dentry)`来发出信号。此方法仅在最后一个组件为负或需要查找时调用。缓存的阳性`dentry`仍然由`f_op->open()`处理。如果文件已经创建，应该在`file->f_mode`中设置`FMODE_CREATED`标志。在`O_EXCL`的情况下，该方法必须只有在文件不存在时才成功，因此`FMODE_CREATED`必须总是在成功时设置。 |
+| `tmpfile`      | 在`O_TMPFILE`的末尾调用`open()`。可选的，相当于在给定目录中自动创建、打开和取消文件链接。成功时需要带着已经打开的文件返回;这可以通过在末尾调用`finish_open_simple()`来完成。 |
+| `fileattr_get` | 调用`ioctl(FS_IOC_GETFLAGS)`和`ioctl(FS_IOC_FSGETXATTR)`来检索杂项文件标志和属性。也在相关`SET`操作之前调用，以检查正在更改的内容(在本例中，`i_rwsem`被锁定为排他)。如果未设置，则返回到`f_op->ioctl()`。 |
+| `fileattr_set` | 调用`ioctl(FS_IOC_SETFLAGS)`和`ioctl(FS_IOC_FSSETXATTR)`来更改杂项文件标志和属性。调用方保持`i_rwsem`独占。如果未设置，则返回到`f_op->ioctl()`。 |
 
