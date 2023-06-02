@@ -222,3 +222,180 @@ struct inode_operations
 | `fileattr_get` | 调用`ioctl(FS_IOC_GETFLAGS)`和`ioctl(FS_IOC_FSGETXATTR)`来检索杂项文件标志和属性。也在相关`SET`操作之前调用，以检查正在更改的内容(在本例中，`i_rwsem`被锁定为排他)。如果未设置，则返回到`f_op->ioctl()`。 |
 | `fileattr_set` | 调用`ioctl(FS_IOC_SETFLAGS)`和`ioctl(FS_IOC_FSSETXATTR)`来更改杂项文件标志和属性。调用方保持`i_rwsem`独占。如果未设置，则返回到`f_op->ioctl()`。 |
 
+## 地址空间对象（The Address Space Object）
+
+地址空间对象用于对页缓存中的页进行分组和管理。它可以用来跟踪文件(或其他任何东西)中的页面，也可以跟踪文件部分到进程地址空间的映射。
+
+地址空间可以提供许多不同但相关的服务。这些包括通信内存压力，按地址查找页面，以及跟踪标记为`Dirty`或`Writeback`的页面。
+
+第一种方法可以独立于其他方法使用。`VM`可以尝试写脏页以清理它们，或者释放干净页以重用它们。要做到这一点，它可以在脏页上调用`->writepage`方法，在设置私有标志的干净页上调用`->release_folio`方法。没有`pagepprivate`和没有外部引用的干净页面将被释放，而不通知给`address_space`。
+
+要实现此功能，需要将页面放置在`LRU`上，并且在使用页面时需要调用`lru_cache_add`和`mark_page_active`。
+
+页面通常保存在一个基数树索引`->index`。该树维护关于每个页面的`PG_Dirty`和`PG_Writeback`状态的信息，因此可以快速找到具有这两个标志之一的页面。
+
+脏标记主要由`mpage_writepages`(默认的`->writepages`方法)使用。它使用标记查找脏页以调用`->writepage`。如果没有使用`mpage_writepages`(即地址提供了它自己的`->writepages`)，`PAGECACHE_TAG_DIRTY`标签几乎是未使用的。`Write_inode_now`和`sync_inode`确实使用它(通过`__sync_single_inode`)来检查`->writpages`是否已经成功地写出了整个`address_space`。
+
+`Writeback`标签由`filemapwait`和`sync_page`函数使用，通过`filemap_fdatawait_range`来等待所有回写完成。
+
+`address_space`处理程序可以将额外的信息附加到页面上，通常使用'`struct page`'中的' `private` '字段。如果附加了此类信息，则应该设置`PG_Private`标志。这将导致各种`VM`例程对`address_space`处理程序进行额外调用，以处理该数据。
+
+地址空间充当存储和应用程序之间的中介。数据一次整页地读入地址空间，并通过复制该页或通过对该页的内存映射提供给应用程序。数据由应用程序写入地址空间，然后通常以整个页面的形式回写到存储中，但是`address_space`对写入大小有更好的控制。
+
+读取过程基本上只需要' `read_folio` '。写过程比较复杂，使用`write_begin`/`write_end`或`dirty_folio`将数据写入`address_space`，使用`writepage`和`writpages`将数据回写到存储。
+
+在`address_space`中添加和删除页面受到`inode`的`i_mutex`的保护。
+
+当数据写入页面时，应该设置`PG_Dirty`标志。它通常保持设置，直到`writepage`要求写入它。这将清除`PG_Dirty`并设置`PG_Writeback`。它实际上可以在`PG_Dirty`清除后的任何时刻写入。一旦知道它是安全的，`PG_Writeback`就会被清除。
+
+回写使用`writeback_control`结构来指导操作。这为`writepage`和`writpages`操作提供了一些关于回写请求的性质和原因的信息，以及执行回写请求的约束条件。它还用于向调用者返回关于`writepage`或`writpages`请求结果的信息。
+
+### 处理回写过程中的错误
+
+大多数使用缓冲`I/O`的应用程序都会定期调用文件同步调用(`fsync`、`fdatasync`、`msync`或`sync_file_range`)，以确保写入的数据已经写入到后备存储。当回写过程中出现错误时，他们希望在发出文件同步请求时报告该错误。在一个请求报告错误后，对同一文件描述符的后续请求应该返回`0`，除非自上次文件同步以来发生了进一步的回写错误。
+
+理想情况下，内核只会在文件描述上报告错误，这些文件描述上的写操作随后无法回写。但是，通用的`pagecache`基础结构不跟踪污染了每个单独页面的文件描述，因此不可能确定哪些文件描述符应该返回错误。
+
+相反，内核中通用的回写错误跟踪基础结构决定在错误发生时向`fsync`报告所有打开的文件描述的错误。在有多个写入器的情况下，所有写入器都会在随后的`fsync`中返回一个错误，即使通过该特定文件描述符完成的所有写操作都成功了(或者即使根本没有对该文件描述符进行写操作)。
+
+希望使用此基础结构的文件系统应该调用`mapping_set_error`，以便在发生错误时在`address_space`中记录错误。然后，在他们的`file->fsync`操作中从`pagecache`回写数据后，他们应该调用`file_check_and_advance_wb_err`来确保`struct`文件的错误游标已经前进到由备份设备发出的错误流中的正确位置。
+
+### `struct address_space_operations`
+
+这描述了`VFS`如何操作文件系统中文件到页面缓存的映射。定义了以下成员:
+
+```c
+struct address_space_operations 
+{
+    int (*writepage)(struct page *page, struct writeback_control *wbc);
+    int (*read_folio)(struct file *, struct folio *);
+    int (*writepages)(struct address_space *, struct writeback_control *);
+    bool (*dirty_folio)(struct address_space *, struct folio *);
+    void (*readahead)(struct readahead_control *);
+    
+    int (*write_begin)(struct file *, struct address_space *mapping,
+                           loff_t pos, unsigned len,
+                        struct page **pagep, void **fsdata);
+    int (*write_end)(struct file *, struct address_space *mapping,
+                         loff_t pos, unsigned len, unsigned copied,
+                         struct page *page, void *fsdata);
+    
+    sector_t (*bmap)(struct address_space *, sector_t);
+    void (*invalidate_folio) (struct folio *, size_t start, size_t len);
+    bool (*release_folio)(struct folio *, gfp_t);
+    void (*free_folio)(struct folio *);
+    ssize_t (*direct_IO)(struct kiocb *, struct iov_iter *iter);
+    int (*migrate_folio)(struct mapping *, struct folio *dst, struct folio *src, enum migrate_mode);
+    int (*launder_folio) (struct folio *);
+
+    bool (*is_partially_uptodate) (struct folio *, size_t from,
+                                       size_t count);
+    void (*is_dirty_writeback)(struct folio *, bool *, bool *);
+    int (*error_remove_page) (struct mapping *mapping, struct page *page);
+    int (*swap_activate)(struct swap_info_struct *sis, struct file *f, sector_t *span);
+    int (*swap_deactivate)(struct file *);
+    int (*swap_rw)(struct kiocb *iocb, struct iov_iter *iter);
+};
+```
+
+| 函数                    | 说明                                                         |
+| ----------------------- | ------------------------------------------------------------ |
+| `writepage`             | 由`VM`调用，将脏页写入后备存储。这可能是出于数据完整性的原因(即“同步”)，或者是为了释放内存(刷新)。在`wbc->sync_mode`中可以看到差异。`PG_Dirty`标志已被清除，`pagellocked`为`true`。`writepage`应该开始写，应该设置`PG_Writeback`，并且应该确保在写操作完成时，页面被同步或异步地解锁。<br/><br/>如果`wbc->sync_mode`为`WB_SYNC_NONE`，则`->writepage`在出现问题时不必太过努力，如果这样做更容易(例如由于内部依赖关系)，则可以选择从映射中写出其他页面。如果它选择不开始写，它应该返回`AOP_WRITEPAGE_ACTIVATE`，这样`VM`就不会一直在该页上调用`->writepage`。<br/><br/>有关详细信息，请参阅文件“`Locking`”。 |
+| `read_folio`            | 由页缓存调用，以从后备存储读取作品集。' `file` '参数为网络文件系统提供身份验证信息，通常不被基于块的文件系统使用。如果调用者没有打开的文件，它可能是`NULL`(例如，如果内核正在为自己执行读取，而不是代表具有打开文件的用户空间进程)。<br/><br/>如果映射不支持大的文件夹，那么文件夹将只包含一个页面。当调用`read_folio`时，该组合将被锁定。如果读取成功完成，则应标记为“更新”。无论读取是否成功，文件系统都应该在读取完成后解锁文件夹。文件系统不需要修改文件夹上的`refcount`;页面缓存保存一个引用计数，直到文件夹被解锁才会释放。<br/><br/>文件系统可以同步实现`->read_folio()`。在正常操作中，通过`->readahead()`方法读取文件夹。只有当这个操作失败，或者调用者需要等待读取操作完成时，页面缓存才会调用`->read_folio()`。文件系统不应该尝试在`->read_folio()`操作中执行自己的预读操作。<br/><br/>如果文件系统此时不能执行读取，它可以解锁文件夹，执行任何需要的操作以确保将来读取成功，并返回`AOP_TRUNCATED_PAGE`。在这种情况下，调用者应该查找组合，锁定它，然后再次调用`->read_folio`。<br/><br/>调用者可以直接调用`->read_folio()`方法，但使用`read_mapping_folio()`将负责锁定，等待读取完成并处理`AOP_TRUNCATED_PAGE`等情况。 |
+| `writepages`            | 由`VM`调用，以写出与`address_space`对象相关联的页面。如果`wbc->sync_mode`为`WB_SYNC_ALL`，则`writeback_control`将指定必须写入的页面范围。如果是`WB_SYNC_NONE`，则给出`nr_to_write`，并且应该尽可能多地写入页面。如果没有`->writepages`，则使用`mpage_writepages`代替。这将从地址空间中选择标记为`DIRTY`的页面，并将它们传递给`->writepage`。 |
+| `dirty_folio`           | 由`VM`调用，将一个文件夹标记为脏的。如果地址空间将私有数据附加到一个文件夹，并且当文件夹被污染时需要更新该数据，则特别需要这样做。例如，当内存映射页被修改时调用该函数。如果定义了，它应该设置`folio dirty`标志，并在`i_pages`中设置`PAGECACHE_TAG_DIRTY`搜索标记。 |
+| `readahead`             | 由`VM`调用以读取与`address_space`对象关联的页面。这些页在页缓存中是连续的，并且被锁定。在每个页面上启动`I/O`后，实现应该减少页面重计数。通常，该页将由`I/O`完成处理程序解锁。页面集被分成一些同步页面，然后是一些异步页面，`rac->ra->async_size`给出了异步页面的数量。文件系统应该尝试读取所有同步页面，但可能会在到达异步页面时决定停止。如果它决定停止尝试`I/O`，它可以简单地返回。调用者将从地址空间中删除剩余的页面，解锁它们并减少页面重新计数。如果`I/O`成功完成，设置`pageupdate`。在任何页面上设置`PageError`都会被忽略;如果发生`I/O`错误，只需解锁页面。 |
+| `write_begin`           | 由通用缓冲写代码调用，要求文件系统准备在文件中给定的偏移量处写入`len`字节。`address_space`应该通过必要时分配空间和执行任何其他内部管理来检查写操作是否能够完成。如果写操作将更新存储上任何基本块的一部分，那么应该预读这些块(如果它们还没有被读取)，以便更新的块可以正确地写出来。<br/><br/>文件系统必须为指定的偏移量(`*pagep`)返回锁定的`pagecache`页面，以便调用者写入。<br/><br/>它必须能够处理短写操作(传递给`write_begin`的长度大于复制到页面中的字节数)。<br/><br/>在`fsdata`中可能返回一个`void *`，然后传递给`write_end`。<br/><br/>成功时返回`0`;失败时`< 0`(这是错误码)，在这种情况下不会调用`write_end`。 |
+| `write_end`             | 在`write_begin`和数据拷贝成功后，必须调用`write_end`。`Len`是传递给`write_begin`的原始`Len`, `copy`是能够复制的数量。<br/><br/>文件系统必须负责对页面进行解锁和释放(`refcount`)，并更新`i_size`。<br/><br/>失败时返回`< 0`，否则返回能够复制到`pagecache`中的字节数(`<= replicated`)。 |
+| `bmap`                  | 由`VFS`调用，将对象内的逻辑块偏移量映射到物理块号。此方法由`FIBMAP ioctl`使用，用于处理交换文件。为了能够交换到文件，该文件必须具有到块设备的稳定映射。交换系统不遍历文件系统，而是使用`bmap`查找文件中的块的位置，并直接使用这些地址。 |
+| `invalidate_folio`      | 如果一个文件夹有私有数据，那么当要从地址空间中删除部分或全部文件夹时，将调用`invalidate_folio`。这通常对应于截断，打孔或地址空间的完全无效(在后一种情况下`offset` 将始终为`0`，`length` 将为`folio_size()`)。任何与投资组合相关的私有数据都应该更新以反映这种截断。如果`offset`为`0`,`length`为`folio_size()`，那么私有数据应该被释放，因为`folio_size`必须能够被完全丢弃。这可以通过调用`->release_folio`函数来完成，但在这种情况下，`release`必须成功。 |
+| `release_folio`         | 在具有私有数据的文件夹上调用`Release_folio`，以告诉文件系统该文件夹即将被释放。`->release_folio`应该从`folio`中删除所有私有数据并清除`private`标志。如果`release_folio()`失败，它应该返回`false`。`release_folio()`用于两种不同但相关的情况。第一种情况是`VM`想要释放一个没有活动用户的干净文件夹。如果`->release_folio`成功，该`folio`将从`address_space`中删除并被释放。<br/><br/>第二种情况是当请求使`address_space`中的部分或全部文件夹无效时。这可以通过`fadvise(POSIX_FADV_DONTNEED)`系统调用来实现，也可以像`nfs`和`9p`那样通过调用`invalidate_inode_pages2()`来显式请求它(当它们认为缓存可能已经过期时)。如果文件系统进行这样的调用，并且需要确定所有的`folio`都是无效的，那么它的`release_folio`将需要确保这一点。如果它还不能释放私有数据，它可能会清除`update`标志。 |
+| `free_folio`            | 一旦`folio`在页面缓存中不再可见，`free_folio`将被调用，以便允许清除任何私有数据。由于它可能由内存回收器调用，因此它不应该假设原始`address_space`映射仍然存在，并且它不应该阻塞。 |
+| `direct_IO`             | 由通用读/写例程调用来执行`direct_IO` -这是绕过页面缓存并直接在存储和应用程序的地址空间之间传输数据的`IO`请求。 |
+| `migrate_folio`         | 这是用来压缩物理内存使用的。如果`VM`想要重新定位一个文件夹(可能是从一个即将发生故障的内存设备)，它将把一个新的文件夹和一个旧的文件夹传递给这个函数。`migrate_folio`应该传输任何私有数据，并更新它对`folio`的任何引用。 |
+| `launder_folio`         | 在释放一个组合之前调用——它回写脏的组合。为了防止重新清理投资组合，它在整个操作过程中都是锁定的。 |
+| `is_partially_uptodate` | 当底层块大小小于文件夹大小时，由`VM`在通过`pagecache`读取文件时调用。如果所需的块是最新的，那么读取就可以完成，而不需要`I/O`来更新整个页面。 |
+| `is_dirty_writeback`    | 虚拟机在尝试回收一个文件夹时调用。虚拟机使用脏信息和回写信息来确定是否需要暂停，以便让`flush`有机会完成某些`IO`。通常它可以使用`folio_test_dirty`和`folio_test_writeback`，但是一些文件系统有更复杂的状态(`NFS`中不稳定的`folio`阻止回收)，或者由于锁定问题而没有设置这些标志。这个回调允许文件系统向`VM`指示是否应该将一个文件夹处理为脏的或回写的以达到停止的目的。 |
+| `error_remove_page`     | 如果可以截断此地址空间，则通常设置为`generic_error_remove_page`。用于内存故障处理。设置此值意味着您要处理在您下面消失的页面，除非您将它们锁定或增加引用计数。 |
+| `swap_activate`         | 调用以准备给定的文件进行交换。它应该执行任何必要的验证和准备，以确保可以用最小的内存分配执行写操作。它应该调用`add_swap_extent()`或助手`iomap_swapfile_activate()`，并返回添加的区段数量。如果要通过`->swap_rw()`提交`IO`，则应设置`SWP_FS_OPS`，否则`IO`将直接提交到块设备`sis->bdev`。 |
+| `swap_deactivate`       | 在`swap_activate`成功执行的文件交换期间调用。                |
+| `swap_rw`               | 当设置了`SWP_FS_OPS`时，调用该函数读取或写入交换页。         |
+
+## 文件对象（File Object）
+
+`file`对象表示由进程打开的文件。这在`POSIX`术语中也称为“打开文件描述”。
+
+### `struct file_operations`
+
+这描述了`VFS`如何操作打开的文件。从内核`4.18`开始，定义了以下成员:
+
+```c
+struct file_operations
+{
+    struct module *owner;
+    loff_t (*llseek) (struct file *, loff_t, int);
+    ssize_t (*read) (struct file *, char __user *, size_t, loff_t *);
+    ssize_t (*write) (struct file *, const char __user *, size_t, loff_t *);
+    ssize_t (*read_iter) (struct kiocb *, struct iov_iter *);
+    ssize_t (*write_iter) (struct kiocb *, struct iov_iter *);
+    int (*iopoll)(struct kiocb *kiocb, bool spin);
+    int (*iterate) (struct file *, struct dir_context *);
+    int (*iterate_shared) (struct file *, struct dir_context *);
+    __poll_t (*poll) (struct file *, struct poll_table_struct *);
+    long (*unlocked_ioctl) (struct file *, unsigned int, unsigned long);
+    long (*compat_ioctl) (struct file *, unsigned int, unsigned long);
+    int (*mmap) (struct file *, struct vm_area_struct *);
+    int (*open) (struct inode *, struct file *);
+    int (*flush) (struct file *, fl_owner_t id);
+    int (*release) (struct inode *, struct file *);
+    int (*fsync) (struct file *, loff_t, loff_t, int datasync);
+    int (*fasync) (int, struct file *, int);
+    int (*lock) (struct file *, int, struct file_lock *);
+    ssize_t (*sendpage) (struct file *, struct page *, int, size_t, loff_t *, int);
+    unsigned long (*get_unmapped_area)(struct file *, unsigned long, unsigned long, unsigned long, unsigned long);
+    int (*check_flags)(int);
+    int (*flock) (struct file *, int, struct file_lock *);
+    ssize_t (*splice_write)(struct pipe_inode_info *, struct file *, loff_t *, size_t, unsigned int);
+    ssize_t (*splice_read)(struct file *, loff_t *, struct pipe_inode_info *, size_t, unsigned int);
+    int (*setlease)(struct file *, long, struct file_lock **, void **);
+    long (*fallocate)(struct file *file, int mode, loff_t offset, loff_t len);
+    void (*show_fdinfo)(struct seq_file *m, struct file *f);
+#ifndef CONFIG_MMU
+    unsigned (*mmap_capabilities)(struct file *);
+#endif
+    ssize_t (*copy_file_range)(struct file *, loff_t, struct file *, loff_t, size_t, unsigned int);
+    loff_t (*remap_file_range)(struct file *file_in, loff_t pos_in,
+                                   struct file *file_out, loff_t pos_out,
+                                   loff_t len, unsigned int remap_flags);
+    int (*fadvise)(struct file *, loff_t, loff_t, int);
+};
+```
+
+同样，除非另有说明，否则调用所有方法时不会持有任何锁。
+
+| 函数                | 说明                                                         |
+| ------------------- | ------------------------------------------------------------ |
+| `llseek`            |                                                              |
+| `read`              |                                                              |
+| `read_iter`         | 可能是以`iov_iter`作为目标的异步读取                         |
+| `write`             |                                                              |
+| `write_iter`        |                                                              |
+| `iopoll`            | 当`io`想要轮询`HIPRI iocb`上的完成时调用                     |
+| `iterate`           | 当`VFS`需要读取目录内容时调用                                |
+| `iterate_shared`    | 当文件系统支持并发目录迭代器时，`VFS`需要读取目录内容时调用  |
+| `poll`              | 当进程想要检查这个文件上是否有活动，并且(可选地)进入休眠状态直到有活动时，由`VFS`调用。由`select(2)`和`poll(2)`系统调用调用 |
+| `unlocked_ioctl`    | 由`ioctl(2)`系统调用调用。                                   |
+| `compat_ioctl`      | 当32位系统调用时，由`ioctl(2)`系统调用调用<br/>用于64位内核。 |
+| `mmap`              | `mmap(2)`                                                    |
+| `open`              | 在应该打开索引节点时由`VFS`调用。当`VFS`打开一个文件时，它会创建一个新的`struct file`。然后，它为新分配的文件结构调用`open`方法。您可能认为`open`方法确实属于`struct inode_operations`，您可能是对的。我认为这样做是因为它使文件系统更容易实现。如果您想要指向设备结构，那么`open()`方法是初始化文件结构中的`private_data`成员的好地方 |
+| `flush`             | 由`close(2)`系统调用调用来刷新文件                           |
+| `release`           | 当对打开文件的最后一个引用关闭时调用                         |
+| `fsync`             | 由`fsync(2)`系统调用调用。也请参阅上面题为“回写期间处理错误”的部分。 |
+| `fasync`            | 当文件启用异步(非阻塞)模式时，由`fcntl(2)`系统调用调用       |
+| `lock`              | 由`fcntl(2)`系统调用`F_GETLK`、`F_SETLK`和`F_SETLKW`命令调用 |
+| `get_unmapped_area` | 由`mmap(2)`系统调用调用                                      |
+| `check_flags`       | 由`fcntl(2)`系统调用`F_SETFL`命令调用                        |
+| `flock`             | 由`flock(2)`系统调用调用                                     |
+| `splice_write`      | 由`VFS`调用，用于将数据从管道拼接到文件中。该方法由`splice(2)`系统调用使用 |
+|                     |                                                              |
+
