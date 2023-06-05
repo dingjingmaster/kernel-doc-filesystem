@@ -397,5 +397,90 @@ struct file_operations
 | `check_flags`       | 由`fcntl(2)`系统调用`F_SETFL`命令调用                        |
 | `flock`             | 由`flock(2)`系统调用调用                                     |
 | `splice_write`      | 由`VFS`调用，用于将数据从管道拼接到文件中。该方法由`splice(2)`系统调用使用 |
-|                     |                                                              |
+| `splice_read`       | 由`VFS`调用，用于将数据从文件拼接到管道。该方法由`splice(2)`系统调用使用 |
+| `setlease`          | 由`VFS`调用，用于设置或释放文件锁租期。`setlease`的实现应该调用`generic_setlease`来记录或删除设置后的`inode`中的租约。 |
+| `fallocate`         | 由`VFS`调用来预分配块或打孔(生成空洞文件)。                  |
+| `copy_file_range`   | 由`copy_file_range(2)`系统调用调用。                         |
+| `remap_file_range`  | 由`ioctl(2)`系统调用`FICLONERANGE`和`FICLONE`和`FIDEDUPERANGE`命令来重新映射文件范围。实现应该将源文件的`post_in`处的`len`字节重新映射到`post_out`处的`dest`文件。实现必须处理传入`len == 0`的调用者;这意味着“重新映射到源文件的末尾”。返回值应该是重新映射的字节数，如果在重新映射任何字节之前发生错误，则返回通常的负错误代码。`remap_flags`参数接受`REMAP_FILE_*`标志。如果设置了`REMAP_FILE_DEDUP`，则只有当请求的文件范围具有相同的内容时，实现才必须重新映射。如果设置了`REMAP_FILE_CAN_SHORTEN`，则调用者可以接受缩短请求长度以满足对齐或`EOF`要求(或任何其他原因)。 |
+| `fadvise`           | 可能由`fadvise64()`系统调用调用。                            |
 
+注意，文件操作是由`inode`所在的特定文件系统实现的。当打开设备节点(字符或块特殊)时，大多数文件系统将调用`VFS`中的特殊支持例程，该例程将定位所需的设备驱动程序信息。这些支持例程将文件系统文件操作替换为设备驱动程序的操作，然后继续为文件调用新的`open()`方法。这就是在文件系统中打开设备文件最终调用设备驱动程序`open()`方法的原因。
+
+## 目录入口缓存(Directory Entry Cache) —— dcache
+
+### `struct dentry_operations`
+
+这描述了文件系统如何重载标准的`dentry`操作。`dentry`和`dcache`是`VFS`和各个文件系统实现的领域。设备驱动程序在这里没有业务。这些方法可以设置为`NULL`，因为它们要么是可选的，要么`VFS`使用默认值。从内核`2.6.22`开始，定义了以下成员:
+
+```c
+struct dentry_operations
+{
+    int (*d_revalidate)(struct dentry *, unsigned int);
+    int (*d_weak_revalidate)(struct dentry *, unsigned int);
+    int (*d_hash)(const struct dentry *, struct qstr *);
+    int (*d_compare)(const struct dentry *, unsigned int, const char *, const struct qstr *);
+    int (*d_delete)(const struct dentry *);
+    int (*d_init)(struct dentry *);
+    void (*d_release)(struct dentry *);
+    void (*d_iput)(struct dentry *, struct inode *);
+    char *(*d_dname)(struct dentry *, char *, int);
+    struct vfsmount *(*d_automount)(struct path *);
+    int (*d_manage)(const struct path *, bool);
+    struct dentry *(*d_real)(struct dentry *, const struct inode *);
+};
+```
+
+| 函数                | 说明                                                         |
+| ------------------- | ------------------------------------------------------------ |
+| `d_revalidate`      | 当`VFS`需要重新验证一个条目时调用。每当名称查找在`dcache`中找到一个`dentry`时，就调用该方法。大多数本地文件系统将其设置为`NULL`，因为它们在`dcache`中的所有`dentry`都是有效的。网络文件系统是不同的，因为服务器上的事情可能发生变化，而客户端不一定会意识到。<br/><br/>如果`dentry`仍然有效，这个函数应该返回一个正值，如果无效则返回零或负错误码。<br/><br/>`d_revalidate`可以在`rcu-walk`模式下调用`(flags & LOOKUP_RCU)`。如果在`rcu-walk`模式下，文件系统必须在不阻塞或存储`dentry`的情况下重新验证`dentry`, `d_parent`和`d_inode`不应该被随意使用(因为它们可以改变，在`d_inode`的情况下，甚至在我们的情况下变为`NULL`)。<br/><br/>如果遇到`rcu-walk`无法处理的情况，返回`-ECHILD`，它将在`ref-walk`模式下再次被调用。 |
+| `d_weak_revalidate` | 当`VFS`需要重新验证“跳跃”的`dentry`时调用。当路径遍历在`dentry`处结束，而该`dentry`不是通过在父目录中进行查找获得的，就会调用该函数。这包括"` /` "`.`"。和“`..`”，以及`procfs`风格的符号链接和挂载点遍历。<br/><br/>在这种情况下，我们不太关心`dentry`是否仍然完全正确，而是关心`inode`是否仍然有效。与`d_revalidate`一样，大多数本地文件系统会将其设置为`NULL`，因为它们的`dcache`条目总是有效的。<br/><br/>此函数具有与`d_revalidate`相同的返回码语义。<br/><br/>`d_weak_revalidate`仅在离开`rcu-walk`模式后调用。 |
+| `d_hash`            | 当`VFS`向哈希表添加一个条目时调用。传递给`d_hash`的第一个`dentry`是名称要散列到的父目录。<br/><br/>与`d_compare`相同的锁定和同步规则，关于什么是安全的解引用等。 |
+| `d_compare`         | 调用以比较`dentry`名称与给定名称。第一个是要比较的父`dentry`，第二个是子`dentry`。`len`和`name string`是要比较的条目的属性。`QSTR`是用来比较它的名称。<br/><br/>必须是常数和幂等的，如果可能的话不应该带锁，也不应该储存在`dentry`里。不应该在不小心的情况下解除对外部指针的引用(例如:不应该使用`d_parent`,`d_inode`, `d_name`)。<br/><br/>然而，我们的`vfsmount`是固定的，`RCU`持有，所以`dentry`和`inode`不会消失，我们的`sb`和文件系统模块也不会消失。可以使用`->d_sb`。<br/><br/>这是一个棘手的调用约定，因为它需要在“`rcu-walk`”下调用，即。没有任何锁或引用的东西。 |
+| `d_delete`          | 当对`dentry`的最后一个引用被删除并且`dcache`正在决定是否缓存它时调用。返回`1`表示立即删除，或返回`0`表示缓存条目。默认值为`NULL`，这意味着始终缓存可访问的条目。`d_delete`必须是常数且幂等的。 |
+| `d_init`            | 在分配`dentry`时调用                                         |
+| `d_release`         | 当一个`dentry`真的被释放时调用                               |
+| `d_iput`            | 当`dentry`失去它的索引节点时调用(就在它被释放之前)。当它为`NULL`时，默认情况是`VFS`调用`input()`。如果您定义了这个方法，您必须自己调用`input()` |
+| `d_dname`           | 当需要生成`dentry`的路径名时调用。用于某些伪文件系统(`sockfs`, `pipefs`，…)延迟路径名的生成。(不是在创建`dentry`时执行，而是只在需要路径时执行)。真正的文件系统可能不想使用它，因为它们的`dentry`存在于全局`dcache`散列中，所以它们的散列应该是不变量。由于没有锁，`d_dname()`不应该尝试修改`dentry`本身，除非使用了适当的`SMP`安全性。注意:`d_path()`逻辑非常棘手。例如，返回“`Hello`”的正确方法是将其放在缓冲区的末尾，并返回指向第一个字符的指针。提供了`dynamic_dname()`帮助函数来处理这个问题。 |
+| `d_automount`       | 当要遍历自动挂载条目时调用(可选)。这将创建一个新的`VFS`挂载记录，并将该记录返回给调用者。为调用者提供了一个路径参数，该参数给出了描述自动挂载目标的自动挂载目录和父`VFS`挂载记录，以提供可继承的挂载参数。如果其他人设法先自动挂载，则应返回`NULL`。如果`vfsmount`创建失败，那么应该返回一个错误代码。如果返回`-EISDIR`，则该目录将被视为普通目录，并返回到`pathwalk`继续遍历。<br/><br/>如果返回一个`vfsmount`，调用者将尝试将其挂载到挂载点上，如果失败，将从其过期列表中删除该`vfsmount`。`vfsmount`应该带2个ref返回，以防止自动过期——调用者将清除额外的ref。<br/><br/>该函数仅在`dentry`上设置了`DCACHE_NEED_AUTOMOUNT`时使用。如果在正在添加的`inode`上设置了`S_AUTOMOUNT`，则由`__d_instantiate()`设置。 |
+| `d_manage`          | 调用以允许文件系统管理从`dentry`的转换(可选)。例如，这允许`autofs`让客户端等待在“挂载点”后面探索，同时让守护进程通过并在那里构建子树。应该返回`0`以让调用进程继续。可以返回`-EISDIR`来告诉`pathwalk`将此目录作为普通目录使用，忽略挂载在其上的任何内容，并且不检查自动挂载标志。任何其他错误代码将完全中止路径行走。<br/><br/>如果' `rcu_walk` '参数为真，则调用者正在以`RCU-walk`模式进行路径行走。在此模式下不允许睡眠，并且可以通过返回`-ECHILD`要求调用方离开该模式并再次调用。`-EISDIR`也可以用来告诉`pathwalk`忽略`d_automount`或任何`mount`。<br/><br/>只有在要传输的条目上设置了`DCACHE_MANAGE_TRANSIT`时，才使用此函数。 |
+| `d_real`            | `overlay/union` 类型文件系统实现此方法以返回覆盖隐藏的底层`dentry`之一。它在两种不同的模式下使用:<br/><br/>从`file_dentry()`调用，它返回与`inode`参数匹配的真实`dentry`。真正的`dentry`可能来自已经复制的较低层，但仍然从文件中引用。使用非`null`索引节点参数选择此模式。<br/><br/>如果索引节点为`NULL`，则返回最上面的实际底层条目。 |
+
+每个`dentry`都有一个指向父`dentry`的指针，以及子`dentry`的散列列表。子条目基本上就像目录中的文件。
+
+## 目录入口缓存API（Directory Entry Cache API）
+
+这里定义了一些允许文件系统操作`dentry`的函数:
+
+| 函数            | 说明                                                         |
+| --------------- | ------------------------------------------------------------ |
+| `dget`          | 为现有条目打开一个新句柄(这只会增加使用计数)                 |
+| `dput`          | 关闭一个条目的句柄(减少使用计数)。如果使用计数下降到`0`，并且`dentry`仍然在其父的哈希中，则调用“`d_delete`”方法来检查是否应该缓存它。如果它不应该被缓存，或者如果`dentry`没有被散列，它将被删除。否则，缓存的`dentry`将被放入`LRU`列表中，以便在内存不足时回收。 |
+| `d_drop`        | 这将从父条目散列列表中解列一个条目。如果`dentry`的使用计数下降到`0`，那么随后对`dput()`的调用将释放`dentry` |
+| `d_delete`      | 删除`dentry`。如果没有其他对`dentry`的开放引用，则将`dentry`转换为负`dentry`(调用`d_iput()`方法)。如果存在其他引用，则调用`d_drop()` |
+| `d_add`         | 将`dentry`添加到其父哈希列表中，然后调用`d_instantiate()`    |
+| `d_instantiate` | 向`inode`的别名散列列表中添加一个`dentry`，并更新“`d_inode`”成员。`inode`结构中的“`i_count`”成员应该设置/递增。如果索引节点指针为`NULL`，则该节点被称为“`负节点`”。当为现有的负条目创建索引节点时，通常调用此函数 |
+| `d_lookup`      | 它从`dcache`哈希表中查找给定父节点和路径名的子节点。如果找到，引用计数将递增并返回条目。调用者在使用完`dentry`后必须使用`dput()`来释放它。 |
+
+## 挂载参数(Mount Options)
+
+### 解析参数
+
+在挂载和重新挂载文件系统时，传递一个字符串，其中包含以逗号分隔的挂载选项列表。选项可以有以下两种形式:
+
+```
+option option=value
+```
+
+`<linux/parser.h>`头文件定义了一个`API`来帮助解析这些选项。关于如何在现有文件系统中使用它，有很多示例。
+
+### 显示选项
+
+如果文件系统接受挂载选项，它必须定义`show_options()`来显示所有当前活动的选项。规则是:
+
+- 必须显示非默认值或其值与默认值不同的选项
+
+- 可能会显示默认启用或具有默认值的选项
+
+仅在挂载助手和内核之间内部使用的选项(如文件描述符)，或仅在挂载期间起作用的选项(如控制日志创建的选项)不受上述规则的约束。
+
+上述规则的根本原因是确保可以根据`/proc/mounts`.中的信息准确地复制挂载(例如，卸载和再次挂载)
